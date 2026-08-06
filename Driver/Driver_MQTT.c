@@ -20,6 +20,8 @@ void Driver_MQTT_ConnectionLost(void *context, char *cause)
 int Driver_MQTT_MessageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
     log_info("收到消息对话topic: %s: %s\n", topicName, (char *)message->payload);
+    MQTTClient_freeMessage(&message);
+    MQTTClient_free(topicName);
     return 1;
 }
 
@@ -37,11 +39,11 @@ void Driver_MQTT_DeliveryComplete(void *context, MQTTClient_deliveryToken dt)
 Com_Status_t Driver_MQTT_Init(void)
 {
 
-    MQTTClient client;
+    static MQTTClient client;
     MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
 
     // 1、创建MQTT客户端
-    int res = MQTTClient_create(&client, ADDRESS, "app_mqtt", MQTTREASONCODE_GRANTED_QOS_0, NULL);
+    int res = MQTTClient_create(&client, ADDRESS, "app_mqtt", MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (res != MQTTCLIENT_SUCCESS)
     {
         log_error("Failed to create MQTT client, return code %d\n", res);
@@ -49,7 +51,7 @@ Com_Status_t Driver_MQTT_Init(void)
     }
 
     conn_opts.keepAliveInterval = 20;
-    conn_opts.cleansession = 1;
+    conn_opts.cleansession = 0;
 
     //  2、设置回调函数
     MQTTClient_setCallbacks(client, NULL, Driver_MQTT_ConnectionLost, Driver_MQTT_MessageArrived, Driver_MQTT_DeliveryComplete);
