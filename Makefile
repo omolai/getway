@@ -1,6 +1,7 @@
 target:=Common/cJSON.c
 target+=Common/log.c
 target+=Driver/Driver_MQTT.c
+target+=Common/Common_Pool.c
 
 # -g 开启gdb的debug调试（生成的二进制文件中包含调试信息）
 # -O0 禁用优化（确保调试一致性）

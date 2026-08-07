@@ -1,8 +1,7 @@
 #ifndef __COMMON_CONFIG_H__
 #define __COMMON_CONFIG_H__
-
-#include <string.h>
-#include "stdlib.h"
+#include "log.h"
+#include "unistd.h"
 
 typedef enum{
     Com_OK,
