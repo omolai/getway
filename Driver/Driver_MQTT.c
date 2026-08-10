@@ -1,201 +1,143 @@
 #include "Driver_MQTT.h"
 
-#include <stdatomic.h>
-#include <time.h>
+static MQTTClient client;
+static MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
 
-static MQTTClient g_client = NULL;
-static atomic_bool g_reconnect_needed = ATOMIC_VAR_INIT(false);
-static int g_initialized = 0;
-static time_t g_last_reconnect_attempt = 0;
-
-static Com_Status_t Driver_MQTT_ConnectAndSubscribe(void)
-{
-    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
-    int res;
-
-    conn_opts.keepAliveInterval = MQTT_KEEP_ALIVE_SECONDS;
-    conn_opts.cleansession = 0;
-
-    res = MQTTClient_connect(g_client, &conn_opts);
-    if (res != MQTTCLIENT_SUCCESS)
-    {
-        log_error("Failed to connect to MQTT server, return code %d", res);
-        return Com_FAIL;
-    }
-
-    res = MQTTClient_subscribe(g_client, TOPIC_PULL, MQTT_SUBSCRIBE_QOS);
-    if (res != MQTTCLIENT_SUCCESS)
-    {
-        log_error("Failed to subscribe to topic %s, return code %d", TOPIC_PULL, res);
-        MQTTClient_disconnect(g_client, TIMEOUT);
-        return Com_FAIL;
-    }
-
-    atomic_store(&g_reconnect_needed, false);
-    log_info("Connected to MQTT server and subscribed to %s", TOPIC_PULL);
-    return Com_OK;
-}
-
+static MqttReceiveCallback receiveHandle;
+/**
+ * @brief 连接断开回调
+ *
+ * @param context
+ * @param cause
+ */
 void Driver_MQTT_ConnectionLost(void *context, char *cause)
 {
-    (void)context;
-    atomic_store(&g_reconnect_needed, true);
-    log_warn("MQTT connection lost: %s", cause != NULL ? cause : "unknown");
+
+    // 重连服务器
+    int res = 0;
+    int time = 0;
+    while (1)
+    {
+        res = MQTTClient_connect(client, &conn_opts);
+        if (res != MQTTCLIENT_SUCCESS)
+        {
+            if (time < 60)
+            {
+                time++;
+            }
+            sleep(time);
+            continue;
+        }
+        // 4、订阅topic
+        res = MQTTClient_subscribe(client, PULL_TOPIC, MQTTREASONCODE_GRANTED_QOS_0);
+        if (res != MQTTCLIENT_SUCCESS)
+        {
+            if (time < 60)
+            {
+                time++;
+            }
+            sleep(time);
+            continue;
+        }
+
+        break;
+    }
 }
 
-int Driver_MQTT_MessageArrived(void *context, char *topic_name, int topic_len,
-                               MQTTClient_message *message)
+/**
+ * @brief 收到消息的回调
+ *
+ * @param context
+ * @param topicName
+ * @param topicLen
+ * @param message
+ * @return int
+ */
+int Driver_MQTT_MessageArrived(void *context, char *topicName, int topicLen, MQTTClient_message *message)
 {
-    int topic_length;
 
-    (void)context;
-    topic_length = topic_len > 0 ? topic_len : (int)strlen(topic_name);
-
-    log_info("Received MQTT message: topic=%.*s, payload=%.*s",
-             topic_length, topic_name,
-             message->payloadlen, (const char *)message->payload);
-
+    if (receiveHandle)
+    {
+        receiveHandle(message->payloadlen, (char *)message->payload);
+    }
+    // 释放内存
     MQTTClient_freeMessage(&message);
-    MQTTClient_free(topic_name);
+    MQTTClient_free(topicName);
+
+    // 返回1代表消息处理成功
     return 1;
 }
 
-void Driver_MQTT_DeliveryComplete(void *context, MQTTClient_deliveryToken token)
+/**
+ * @brief 消息发送完成回调
+ *
+ * @param context
+ * @param dt
+ */
+void Driver_MQTT_DeliveryComplete(void *context, MQTTClient_deliveryToken dt)
 {
-    (void)context;
-    log_info("MQTT delivery complete, token=%d", token);
+    log_info("消息发送完成");
 }
-
-Com_Status_t Driver_MQTT_Init(void)
+Com_Status_t Driver_MQTT_Init(MqttReceiveCallback rcb)
 {
-    int res;
 
-    if (g_initialized)
-    {
-        return Driver_MQTT_IsConnected() ? Com_OK : Com_FAIL;
-    }
-
-    res = MQTTClient_create(&g_client, ADDRESS, CLIENT_ID,
-                            MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    receiveHandle = rcb;
+    // 1、创建MQTT客户端
+    int res = MQTTClient_create(&client, MQTT_SERVER_URL, "app_mqtt", MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (res != MQTTCLIENT_SUCCESS)
     {
-        log_error("Failed to create MQTT client, return code %d", res);
+        log_info("mqtt client create fail");
         return Com_FAIL;
     }
+    conn_opts.keepAliveInterval = 20;
+    conn_opts.cleansession = 1;
 
-    res = MQTTClient_setCallbacks(g_client, NULL,
-                                  Driver_MQTT_ConnectionLost,
-                                  Driver_MQTT_MessageArrived,
-                                  Driver_MQTT_DeliveryComplete);
+    // 2、设置回调
+    MQTTClient_setCallbacks(client, NULL, Driver_MQTT_ConnectionLost, Driver_MQTT_MessageArrived, Driver_MQTT_DeliveryComplete);
+    // 3、连接服务器
+    res = MQTTClient_connect(client, &conn_opts);
     if (res != MQTTCLIENT_SUCCESS)
     {
-        log_error("Failed to set MQTT callbacks, return code %d", res);
-        MQTTClient_destroy(&g_client);
+        log_info("mqtt client connect server fail");
         return Com_FAIL;
     }
-
-    g_initialized = 1;
-    atomic_store(&g_reconnect_needed, true);
-    return Driver_MQTT_ConnectAndSubscribe();
-}
-
-void Driver_MQTT_Process(void)
-{
-    time_t now;
-    bool reconnect_requested;
-
-    if (!g_initialized)
-    {
-        return;
-    }
-
-    reconnect_requested = atomic_load(&g_reconnect_needed);
-    if (!reconnect_requested && MQTTClient_isConnected(g_client))
-    {
-        return;
-    }
-
-    if (MQTTClient_isConnected(g_client))
-    {
-        atomic_store(&g_reconnect_needed, false);
-        return;
-    }
-
-    atomic_store(&g_reconnect_needed, true);
-    now = time(NULL);
-    if (g_last_reconnect_attempt != 0 &&
-        now - g_last_reconnect_attempt < MQTT_RECONNECT_INTERVAL_SECONDS)
-    {
-        return;
-    }
-
-    g_last_reconnect_attempt = now;
-    log_info("Attempting MQTT reconnect");
-    if (Driver_MQTT_ConnectAndSubscribe() != Com_OK)
-    {
-        atomic_store(&g_reconnect_needed, true);
-    }
-}
-
-Com_Status_t Driver_MQTT_Publish(const char *topic, const void *payload,
-                                 int payload_len, int qos, int retained)
-{
-    MQTTClient_message message = MQTTClient_message_initializer;
-    MQTTClient_deliveryToken token;
-    int res;
-
-    if (!g_initialized || topic == NULL || payload_len < 0 ||
-        (payload == NULL && payload_len > 0) || qos < 0 || qos > 2)
-    {
-        return Com_FAIL;
-    }
-
-    if (!MQTTClient_isConnected(g_client))
-    {
-        atomic_store(&g_reconnect_needed, true);
-        log_warn("MQTT publish skipped because the client is disconnected");
-        return Com_FAIL;
-    }
-
-    message.payload = (void *)payload;
-    message.payloadlen = payload_len;
-    message.qos = qos;
-    message.retained = retained != 0;
-
-    res = MQTTClient_publishMessage(g_client, topic, &message, &token);
+    // 4、订阅topic
+    res = MQTTClient_subscribe(client, PULL_TOPIC, MQTTREASONCODE_GRANTED_QOS_0);
     if (res != MQTTCLIENT_SUCCESS)
     {
-        log_error("Failed to publish to topic %s, return code %d", topic, res);
+        log_info("mqtt client subscribe fail");
         return Com_FAIL;
     }
-
-    log_info("Published MQTT message: topic=%s, qos=%d, token=%d", topic, qos, token);
     return Com_OK;
 }
 
-int Driver_MQTT_IsConnected(void)
+/**
+ * @brief 向指定topic发送数据
+ *
+ * @param topicName
+ * @param datas
+ * @param len
+ */
+void Driver_MQTT_Send(char *topicName, char *datas, int len)
 {
-    return g_initialized && MQTTClient_isConnected(g_client);
-}
 
-void Driver_MQTT_Disconnect(void)
-{
-    if (Driver_MQTT_IsConnected())
-    {
-        MQTTClient_disconnect(g_client, TIMEOUT);
-    }
-}
-
-void Driver_MQTT_Deinit(void)
-{
-    if (!g_initialized)
+    if (topicName == NULL || datas == NULL || len <= 0 || client == NULL)
     {
         return;
     }
+    MQTTClient_publish(client, topicName, len, datas, MQTTREASONCODE_GRANTED_QOS_0, 0, NULL);
+}
 
-    Driver_MQTT_Disconnect();
-    MQTTClient_destroy(&g_client);
-    g_initialized = 0;
-    g_last_reconnect_attempt = 0;
-    atomic_store(&g_reconnect_needed, false);
+/**
+ * @brief 资源回收
+ *
+ */
+void Driver_MQTT_Deinit(void)
+{
+    if (client)
+    {
+
+        MQTTClient_disconnect(client, 2000);
+        MQTTClient_destroy(&client);
+    }
 }
